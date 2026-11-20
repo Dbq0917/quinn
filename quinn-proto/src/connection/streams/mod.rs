@@ -136,7 +136,7 @@ impl RecvStream<'_> {
         };
         let stream = get_or_insert_recv(entry.get_mut(), self.state.stream_receive_window);
 
-        let (read_credits, stop_sending) = stream.stop()?;
+        let stop_sending = stream.stop()?;
         if stop_sending.should_transmit() {
             self.pending.stop_sending.push(frame::StopSending {
                 id: self.id,
@@ -150,10 +150,6 @@ impl RecvStream<'_> {
         if !stream.final_offset_unknown() {
             let recv = entry.remove().expect("must have recv when stopping");
             self.state.stream_recv_freed(self.id, recv);
-        }
-
-        if self.state.add_read_credits(read_credits).should_transmit() {
-            self.pending.max_data = true;
         }
 
         Ok(())

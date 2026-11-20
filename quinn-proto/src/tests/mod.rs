@@ -1682,32 +1682,20 @@ fn data_blocked() {
         1
     );
 
-    // Being refused again at the same limit does not repeat the frame
-    assert_matches!(
-        pair.client_send(client_ch, s).write(b"c"),
-        Err(WriteError::Blocked)
-    );
-    pair.drive();
-    assert_eq!(
-        pair.client_conn_mut(client_ch)
-            .stats()
-            .frame_tx
-            .data_blocked,
-        1
-    );
-
-    // Running into the raised limit is reported again
+    // The server issues connection-level credit on receipt, so the window is
+    // replenished without the application reading anything
     assert_matches!(pair.server_streams(server_ch).accept(Dir::Uni), Some(stream) if stream == s);
-    let mut recv = pair.server_recv(server_ch, s);
-    let mut chunks = recv.read(true).unwrap();
-    assert_matches!(chunks.next(usize::MAX), Ok(Some(chunk)) if chunk.bytes.len() == 10);
-    let _ = chunks.finalize();
-    pair.drive();
     assert_eq!(
         pair.client_send(client_ch, s)
             .write(b"0123456789ab")
             .unwrap(),
         10
+    );
+
+    // Being refused repeatedly at the same limit does not repeat the frame
+    assert_matches!(
+        pair.client_send(client_ch, s).write(b"c"),
+        Err(WriteError::Blocked)
     );
     assert_matches!(
         pair.client_send(client_ch, s).write(b"c"),
@@ -1717,6 +1705,16 @@ fn data_blocked() {
     let stats = pair.client_conn_mut(client_ch).stats();
     assert_eq!(stats.frame_tx.data_blocked, 2);
     assert_eq!(stats.frame_tx.stream_data_blocked, 0);
+
+    // The data the server received is readable as usual
+    let mut recv = pair.server_recv(server_ch, s);
+    let mut chunks = recv.read(true).unwrap();
+    let mut received = 0;
+    while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
+        received += chunk.bytes.len();
+    }
+    assert_eq!(received, 20);
+    let _ = chunks.finalize();
 }
 
 #[test]
@@ -2466,6 +2464,212 @@ fn conn_flow_control() {
     );
 }
 
+/// Data buffered on a stream the application doesn't read must not consume the
+/// connection-level flow control window: connection-level credit is issued on
+/// receipt, while stream-level credit is still only issued on reads.
+#[test]
+fn unread_stream_does_not_consume_connection_window() {
+    let _guard = subscribe();
+    const WINDOW: usize = 10_000;
+    let mut pair = Pair::new(
+        Default::default(),
+        ServerConfig {
+            transport: Arc::new(TransportConfig {
+                receive_window: (WINDOW as u32).into(),
+                stream_receive_window: (WINDOW as u32).into(),
+                ..TransportConfig::default()
+            }),
+            ..server_config()
+        },
+    );
+    let (client_ch, server_ch) = pair.connect();
+    let data = vec![0xAB; WINDOW];
+
+    // Fill the connection-level window with data on a stream the server never reads
+    let slow = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    assert_eq!(pair.client_send(client_ch, slow).write(&data), Ok(WINDOW));
+    assert_matches!(
+        pair.client_send(client_ch, slow).write(&[0]),
+        Err(WriteError::Blocked)
+    );
+    pair.drive();
+
+    // The slow stream stays blocked on its own stream-level window, which the
+    // server doesn't replenish because it doesn't read
+    assert_matches!(
+        pair.client_send(client_ch, slow).write(&[0]),
+        Err(WriteError::Blocked)
+    );
+
+    // A second stream still has its full allowance available, because the
+    // connection-level window was replenished when the slow stream's data was
+    // received rather than when it is read
+    let fast = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    assert_eq!(pair.client_send(client_ch, fast).write(&data), Ok(WINDOW));
+    pair.drive();
+
+    let mut recv = pair.server_recv(server_ch, fast);
+    let mut chunks = recv.read(true).unwrap();
+    let mut received = 0;
+    while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
+        received += chunk.bytes.len();
+    }
+    let _ = chunks.finalize();
+    assert_eq!(received, WINDOW);
+}
+
+/// A slowly-read stream must not starve a concurrently-read stream on the same
+/// connection: the fast stream's throughput should be bounded by the network,
+/// not by the slow stream's share of the connection-level window.
+#[test]
+fn slow_stream_does_not_starve_fast_stream() {
+    let _guard = subscribe();
+    const STREAM_WINDOW: usize = 16_000;
+    const TOTAL: usize = 8 * STREAM_WINDOW;
+    let mut pair = Pair::new(
+        Default::default(),
+        ServerConfig {
+            transport: Arc::new(TransportConfig {
+                // Sized so that the slow stream's unread data would occupy the
+                // entire connection-level window if credit were only issued on
+                // reads
+                receive_window: (STREAM_WINDOW as u32).into(),
+                stream_receive_window: (STREAM_WINDOW as u32).into(),
+                ..TransportConfig::default()
+            }),
+            ..server_config()
+        },
+    );
+    let (client_ch, server_ch) = pair.connect();
+    let slow = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    let fast = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+
+    let data = vec![0xAB; TOTAL];
+    let (mut slow_written, mut fast_written) = (0, 0);
+    let mut fast_received = 0;
+
+    // The server reads the fast stream eagerly, but never reads the slow stream
+    for _ in 0..1000 {
+        if fast_received == TOTAL {
+            break;
+        }
+        if slow_written < TOTAL
+            && let Ok(n) = pair
+                .client_send(client_ch, slow)
+                .write(&data[slow_written..])
+        {
+            slow_written += n;
+        }
+        if fast_written < TOTAL
+            && let Ok(n) = pair
+                .client_send(client_ch, fast)
+                .write(&data[fast_written..])
+        {
+            fast_written += n;
+        }
+        pair.drive();
+
+        // The fast stream may not exist on the server yet if its first write
+        // is still waiting for connection-level credit
+        let mut recv = pair.server_recv(server_ch, fast);
+        if let Ok(mut chunks) = recv.read(true) {
+            while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
+                fast_received += chunk.bytes.len();
+            }
+            let _ = chunks.finalize();
+        }
+        pair.drive();
+    }
+
+    // The fast stream completes its transfer...
+    assert_eq!(fast_received, TOTAL, "fast stream was starved");
+    // ...while the slow stream is throttled to roughly its own stream-level
+    // window, because the server never reads it
+    assert!(
+        slow_written <= 2 * STREAM_WINDOW,
+        "slow stream escaped its stream-level window: {slow_written}"
+    );
+    assert!(
+        fast_received >= 4 * slow_written,
+        "fast ({fast_received}) vs slow ({slow_written}) throughput mismatch"
+    );
+}
+
+/// Application-level heartbeats on a dedicated stream must get through while a
+/// bulk transfer on another stream is blocked on a slow reader, so the peer
+/// doesn't judge the connection dead.
+#[test]
+fn bulk_stream_does_not_block_heartbeat() {
+    let _guard = subscribe();
+    const IDLE_TIMEOUT: u64 = 10_000;
+    const HEARTBEAT_INTERVAL: u64 = 2_000;
+    const HEARTBEATS: u64 = 8;
+    let transport = || TransportConfig {
+        max_idle_timeout: Some(VarInt(IDLE_TIMEOUT)),
+        // Sized so that the stalled bulk transfer would occupy the entire
+        // connection-level window if credit were only issued on reads
+        receive_window: 16_000u32.into(),
+        stream_receive_window: 16_000u32.into(),
+        ..TransportConfig::default()
+    };
+    let mut pair = Pair::new(
+        Default::default(),
+        ServerConfig {
+            transport: Arc::new(transport()),
+            ..server_config()
+        },
+    );
+    let mut client_config = client_config();
+    client_config.transport = Arc::new(transport());
+    let (client_ch, server_ch) = pair.connect_with(client_config);
+
+    // Start a bulk transfer; the server never reads it, so it quickly fills its
+    // stream-level window and would also occupy the whole connection-level
+    // window if credit were only issued on reads
+    let bulk = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    let heartbeat = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    let bulk_data = vec![0xAB; 64_000];
+    let mut bulk_written = pair.client_send(client_ch, bulk).write(&bulk_data).unwrap();
+    pair.drive();
+
+    let mut heartbeats_received = 0;
+    for i in 0..HEARTBEATS {
+        // Simulate the application sleeping between heartbeats
+        pair.time += Duration::from_millis(HEARTBEAT_INTERVAL);
+
+        // The heartbeat must not be blocked by the stalled bulk transfer
+        assert_eq!(
+            pair.client_send(client_ch, heartbeat).write(b"ping"),
+            Ok(4),
+            "heartbeat {i} blocked by bulk transfer"
+        );
+        if let Ok(n) = pair.client_send(client_ch, bulk).write(&bulk_data) {
+            bulk_written += n;
+        }
+        pair.drive();
+
+        let mut recv = pair.server_recv(server_ch, heartbeat);
+        let mut chunks = recv.read(true).unwrap();
+        while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
+            heartbeats_received += chunk.bytes.len();
+        }
+        let _ = chunks.finalize();
+        assert_eq!(
+            heartbeats_received,
+            4 * (i + 1) as usize,
+            "heartbeat {i} not delivered promptly"
+        );
+
+        // The connection must not be judged dead while the bulk transfer is stuck
+        assert!(!pair.client_conn_mut(client_ch).is_closed());
+        assert!(!pair.server_conn_mut(server_ch).is_closed());
+    }
+
+    // The heartbeats kept flowing for longer than the idle timeout, even though
+    // the bulk stream remained blocked on its own stream-level window
+    const { assert!(HEARTBEATS * HEARTBEAT_INTERVAL > IDLE_TIMEOUT) };
+    assert!(bulk_written <= 2 * 16_000);
+}
 #[test]
 fn stop_opens_bidi() {
     let _guard = subscribe();

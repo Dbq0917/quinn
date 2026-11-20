@@ -279,10 +279,18 @@ impl StreamsState {
         let (new_bytes, closed) =
             rs.ingest(frame, payload_len, self.data_recvd, self.local_max_data)?;
         self.data_recvd = self.data_recvd.saturating_add(new_bytes);
+        let stopped = rs.stopped;
 
-        if !rs.stopped {
+        // Issue connection-level flow control credit as soon as data is received, so that data
+        // buffered on streams the application is slow to read doesn't consume the shared
+        // connection-level window and thereby block other streams. Stream-level flow control
+        // credit is still only issued as the application reads, so per-stream backpressure is
+        // preserved and a slow stream is throttled independently of the others.
+        let should_transmit = self.add_connection_credits(new_bytes);
+
+        if !stopped {
             self.events.push_back(StreamEvent::Readable { id });
-            return Ok(ShouldTransmit(false));
+            return Ok(should_transmit);
         }
 
         // Stopped streams become closed instantly on FIN, so check whether we need to clean up
@@ -291,8 +299,7 @@ impl StreamsState {
             self.stream_recv_freed(id, rs);
         }
 
-        // We don't buffer data on stopped streams, so issue flow control credit immediately
-        Ok(self.add_read_credits(new_bytes))
+        Ok(should_transmit)
     }
 
     /// Process incoming RESET_STREAM frame
@@ -333,11 +340,8 @@ impl StreamsState {
             // Redundant reset
             return Ok(ShouldTransmit(false));
         }
-        let bytes_read = rs.assembler.bytes_read();
         let stopped = rs.stopped;
         let end = rs.end;
-        // Stopped streams have already returned read credits up to their highest offset.
-        let credited = if stopped { end } else { bytes_read };
         if stopped {
             // Stopped streams should be disposed immediately on reset
             let rs = self.recv.remove(&id).flatten().unwrap();
@@ -346,16 +350,12 @@ impl StreamsState {
             self.events.push_back(StreamEvent::Readable { id });
         }
 
-        // Update connection-level flow control
-        Ok(if credited != final_offset.into_inner() {
-            // credited is always <= end, so this won't underflow.
-            self.data_recvd = self
-                .data_recvd
-                .saturating_add(u64::from(final_offset) - end);
-            self.add_read_credits(u64::from(final_offset) - credited)
-        } else {
-            ShouldTransmit(false)
-        })
+        // Update connection-level flow control for the bytes the peer consumed window for, but
+        // which never arrived. Bytes that were received were already credited on receipt.
+        // `end` is always <= `final_offset`, so this won't underflow.
+        let unreceived = u64::from(final_offset) - end;
+        self.data_recvd = self.data_recvd.saturating_add(unreceived);
+        Ok(self.add_connection_credits(unreceived))
     }
 
     /// Process incoming `STOP_SENDING` frame
@@ -977,7 +977,12 @@ impl StreamsState {
     /// queued, the [`Recv::record_sent_max_stream_data`] function should be called to
     /// suppress sending further updates until the window increases significantly
     /// again.
-    pub(super) fn add_read_credits(&mut self, credits: u64) -> ShouldTransmit {
+    ///
+    /// Credits are added when stream data is received (or accounted for, in the case of
+    /// resets), independently of when the application reads it. This keeps the
+    /// connection-level window from being consumed by unread data buffered on individual
+    /// streams, so that a slowly-read stream cannot block other streams on the connection.
+    pub(super) fn add_connection_credits(&mut self, credits: u64) -> ShouldTransmit {
         if credits > self.receive_window_shrink_debt {
             let net_credits = credits - self.receive_window_shrink_debt;
             self.local_max_data = self.local_max_data.saturating_add(net_credits);
@@ -1227,7 +1232,11 @@ mod tests {
             ShouldTransmit(false)
         );
         assert_eq!(client.data_recvd, 2048);
-        assert_eq!(client.local_max_data - initial_max, 0);
+        assert_eq!(
+            client.local_max_data - initial_max,
+            2048,
+            "connection-level credit is issued on receipt"
+        );
 
         let mut pending = Retransmits::default();
         let mut recv = RecvStream {
@@ -1245,7 +1254,11 @@ mod tests {
         let should_transmit = chunks.finalize();
         assert!(should_transmit.0);
         assert!(pending.max_stream_id[Dir::Uni as usize]);
-        assert_eq!(client.local_max_data - initial_max, MESSAGE_SIZE as u64);
+        assert_eq!(
+            client.local_max_data - initial_max,
+            MESSAGE_SIZE as u64,
+            "reading must not issue connection-level credit a second time"
+        );
     }
 
     #[test]
@@ -1268,7 +1281,7 @@ mod tests {
             ShouldTransmit(false)
         );
         assert_eq!(client.data_recvd, 2048);
-        assert_eq!(client.local_max_data - initial_max, 0);
+        assert_eq!(client.local_max_data - initial_max, 2048);
 
         let mut pending = Retransmits::default();
         let mut recv = RecvStream {
@@ -1280,7 +1293,11 @@ mod tests {
         let mut chunks = recv.read(true).unwrap();
         chunks.next(1024).unwrap();
         let _ = chunks.finalize();
-        assert_eq!(client.local_max_data - initial_max, 1024);
+        assert_eq!(
+            client.local_max_data - initial_max,
+            2048,
+            "reading must not issue additional connection-level credit"
+        );
         assert_eq!(
             client
                 .received_reset(frame::ResetStream {
@@ -1331,7 +1348,7 @@ mod tests {
             ShouldTransmit(false)
         );
         assert_eq!(client.data_recvd, 4096);
-        assert_eq!(client.local_max_data - initial_max, 0);
+        assert_eq!(client.local_max_data - initial_max, 4096);
         assert_eq!(
             client
                 .received_reset(frame::ResetStream {
@@ -1393,7 +1410,11 @@ mod tests {
                 .unwrap(),
             ShouldTransmit(false)
         );
-        assert_eq!(client.local_max_data, initial_max);
+        assert_eq!(
+            client.local_max_data,
+            initial_max + 32,
+            "connection-level credit is issued on receipt"
+        );
 
         let mut pending = Retransmits::default();
         let mut recv = RecvStream {
@@ -2274,7 +2295,7 @@ mod tests {
 
         // credit, expecting all of them added to local_max_data
         let credits = 1024u64;
-        let should_transmit = server.add_read_credits(credits);
+        let should_transmit = server.add_connection_credits(credits);
         assert_eq!(server.receive_window_shrink_debt, 0);
         assert_eq!(server.local_max_data, prev_local_max_data + credits);
         assert!(should_transmit.should_transmit());
@@ -2299,7 +2320,7 @@ mod tests {
         let credits = 1024u64;
         for _ in 0..2 {
             let expected_receive_window_shrink_debt = server.receive_window_shrink_debt - credits;
-            let should_transmit = server.add_read_credits(credits);
+            let should_transmit = server.add_connection_credits(credits);
             assert_eq!(
                 server.receive_window_shrink_debt,
                 expected_receive_window_shrink_debt
@@ -2313,7 +2334,7 @@ mod tests {
         let prev_local_max_data = server.local_max_data;
         let expected_local_max_data =
             server.local_max_data + (credits - server.receive_window_shrink_debt);
-        let _should_transmit = server.add_read_credits(credits);
+        let _should_transmit = server.add_connection_credits(credits);
         assert_eq!(server.receive_window_shrink_debt, 0);
         assert_eq!(server.local_max_data, expected_local_max_data);
         assert!(server.local_max_data > prev_local_max_data);
@@ -2321,7 +2342,7 @@ mod tests {
         // credit again, all should be added to local_max_data
         let credits = 1024 * 512;
         let expected_local_max_data = server.local_max_data + credits;
-        let should_transmit = server.add_read_credits(credits);
+        let should_transmit = server.add_connection_credits(credits);
         assert_eq!(server.receive_window_shrink_debt, 0);
         assert_eq!(server.local_max_data, expected_local_max_data);
         assert!(should_transmit.should_transmit());

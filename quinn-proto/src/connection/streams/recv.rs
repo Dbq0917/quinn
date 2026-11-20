@@ -87,23 +87,22 @@ impl Recv {
         Ok((new_bytes, frame.fin && self.stopped))
     }
 
-    pub(super) fn stop(&mut self) -> Result<(u64, ShouldTransmit), ClosedStream> {
+    pub(super) fn stop(&mut self) -> Result<ShouldTransmit, ClosedStream> {
         if self.stopped {
             return Err(ClosedStream { _private: () });
         }
 
         self.stopped = true;
         self.assembler.clear();
-        // Issue flow control credit for unread data, unless a reset already did
-        let read_credits = match self.state {
-            RecvState::ResetRecvd { .. } => 0,
-            _ => self.end - self.assembler.bytes_read(),
-        };
         // This may send a spurious STOP_SENDING if we've already received all data, but it's a bit
         // fiddly to distinguish that from the case where we've received a FIN but are missing some
         // data that the peer might still be trying to retransmit, in which case a STOP_SENDING is
         // still useful.
-        Ok((read_credits, ShouldTransmit(self.is_receiving())))
+        //
+        // No connection-level flow control credit is issued here: credit for all received data
+        // was already issued on receipt, and credit for data that never arrived is issued when
+        // the peer's RESET_STREAM is processed.
+        Ok(ShouldTransmit(self.is_receiving()))
     }
 
     /// Returns the window that should be advertised in a `MAX_STREAM_DATA` frame
@@ -240,8 +239,9 @@ impl Recv {
 /// Chunks returned from [`RecvStream::read()`][crate::RecvStream::read].
 ///
 /// ### Note: Finalization Needed
-/// Bytes read from the stream are not released from the congestion window until
-/// either [`Self::finalize()`] is called, or this type is dropped.
+/// Stream-level flow control credit for bytes read from the stream is not released until
+/// either [`Self::finalize()`] is called, or this type is dropped. Connection-level flow
+/// control credit is issued as data is received, so it does not depend on finalization.
 ///
 /// It is recommended that you call [`Self::finalize()`] because it returns a flag
 /// telling you whether reading from the stream has resulted in the need to transmit a packet.
@@ -254,7 +254,6 @@ pub struct Chunks<'a> {
     streams: &'a mut StreamsState,
     pending: &'a mut Retransmits,
     state: ChunksState,
-    read: u64,
 }
 
 impl<'a> Chunks<'a> {
@@ -281,7 +280,6 @@ impl<'a> Chunks<'a> {
             streams,
             pending,
             state: ChunksState::Readable(recv),
-            read: 0,
         })
     }
 
@@ -301,13 +299,11 @@ impl<'a> Chunks<'a> {
         };
 
         if let Some(chunk) = rs.assembler.read(max_length, self.ordered) {
-            self.read += chunk.bytes.len() as u64;
             return Ok(Some(chunk));
         }
 
         match rs.state {
             RecvState::ResetRecvd { error_code, .. } => {
-                debug_assert_eq!(self.read, 0, "reset streams have empty buffers");
                 let state = mem::replace(&mut self.state, ChunksState::Reset(error_code));
                 // At this point if we have `rs` self.state must be `ChunksState::Readable`
                 let recv = match state {
@@ -340,8 +336,8 @@ impl<'a> Chunks<'a> {
 
     /// Mark the read data as consumed from the stream.
     ///
-    /// The number of read bytes will be released from the congestion window,
-    /// allowing the remote peer to send more data if it was previously blocked.
+    /// Stream-level flow control credit for the number of read bytes will be released,
+    /// allowing the remote peer to send more data on this stream if it was previously blocked.
     ///
     /// If [`ShouldTransmit::should_transmit()`] returns `true`,
     /// a packet needs to be sent to the peer informing them that the stream is unblocked.
@@ -376,10 +372,6 @@ impl<'a> Chunks<'a> {
                 .insert(self.id, Some(StreamRecv::Open(rs)));
         }
 
-        // Issue connection-level flow control credit for any data we read regardless of state
-        let max_data = self.streams.add_read_credits(self.read);
-        self.pending.max_data |= max_data.0;
-        should_transmit |= max_data.0;
         ShouldTransmit(should_transmit)
     }
 }
@@ -478,13 +470,8 @@ mod tests {
         assert_eq!(new_bytes, INITIAL_OFFSET + INITIAL_BYTES);
         assert!(!is_closed);
 
-        let (credits, transmit) = s.stop().unwrap();
+        let transmit = s.stop().unwrap();
         assert!(transmit.should_transmit());
-        assert_eq!(
-            credits,
-            INITIAL_OFFSET + INITIAL_BYTES,
-            "full connection flow control credit is issued by stop"
-        );
 
         let (max_stream_data, transmit) = s.max_stream_data(RECV_WINDOW);
         assert!(!transmit.should_transmit());
